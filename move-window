@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+from subprocess import Popen, PIPE
+from optparse import OptionParser
+
+WINDOW_MAXED_V = '_NET_WM_STATE_MAXIMIZED_VERT'
+WINDOW_MAXED_H = '_NET_WM_STATE_MAXIMIZED_HORZ'
+TOP_LEFT_X = 'Absolute upper-left X'
+TOP_LEFT_Y = 'Absolute upper-left Y'
+TOP_LEFT_OFFSET_X = 'Relative upper-left X'
+TOP_LEFT_OFFSET_Y = 'Relative upper-left Y'
+WIDTH = 'Width'
+HEIGHT = 'Height'
+
+
+class Pixel:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+    def __repr__(self):
+        return 'Pixel({x}, {y})'.format(x=self.x, y=self.y)
+
+
+class Monitor:
+    def __init__(self, top_left, width, height):
+        self.top_left = top_left
+        self.width = width
+        self.height = height
+
+    def __contains__(self, pixel):
+        return (
+            self.top_left.x <= pixel.x < self.top_left.x + self.width and
+            self.top_left.y <= pixel.y < self.top_left.y + self.height
+        )
+
+    def __repr__(self):
+        return 'Monitor({corner}, {width}, {height})'.format(
+            corner=repr(self.top_left), width=self.width, height=self.height
+        )
+
+
+class Window:
+    def __init__(self, window_id, top_left, width, height, maxed_v, maxed_h):
+        self.window_id = window_id
+        self.top_left = top_left
+        self.width = width
+        self.height = height
+        self.maxed_v = maxed_v
+        self.maxed_h = maxed_h
+
+    def __repr__(self):
+        return (
+            'Window({window_id}, {corner}, {width}, {height}, '
+            'maxed_v={maxed_v}, maxed_h={maxed_h})'.format(
+                window_id=self.window_id, corner=repr(self.top_left),
+                width=self.width, height=self.height, maxed_v=self.maxed_v,
+                maxed_h=self.maxed_h,
+            )
+        )
+
+
+def run(args):
+    proc = Popen(args, stdout=PIPE, stderr=PIPE)
+    out, err = proc.communicate()
+    if err:
+        raise OSError(err.decode('utf-8'))
+    return out.decode('utf-8')
+
+
+def all_monitors():
+    args = ['xrandr', '--listmonitors']
+    out = run(args).strip().split('\n')[1:]
+    info = []
+    for monitor_info in out:
+        monitor_info = monitor_info.strip().split(':')[1].strip().split(' ')[1]
+        dimensions, top_x, top_y = monitor_info.split('+')
+        width, height = dimensions.split('x')
+        width = int(width.split('/')[0])
+        height = int(height.split('/')[0])
+        corner = Pixel(int(top_x), int(top_y))
+        info.append(Monitor(corner, width, height))
+
+    return info
+
+
+def get_active_window_info(window_id):
+    win_info = run(['xwininfo', '-id', window_id]).strip().split('\n')
+    out = {}
+    for line in win_info:
+        if ':' in line:
+            try:
+                key, value = line.split(':')
+            except ValueError:
+                continue
+            try:
+                out[key.strip()] = int(value.strip())
+            except ValueError:
+                continue
+    x = out[TOP_LEFT_X] - out[TOP_LEFT_OFFSET_X]
+    y = out[TOP_LEFT_Y] - out[TOP_LEFT_OFFSET_Y]
+    return Pixel(x, y), out[WIDTH], out[HEIGHT]
+
+
+def get_active_window():
+    window_id = run(['xdotool', 'getactivewindow']).strip()
+    maxed_info = run(['xprop', '-id', window_id, '_NET_WM_STATE'])
+    maxed_v = WINDOW_MAXED_V in maxed_info
+    maxed_h = WINDOW_MAXED_H in maxed_info
+    win_corner, win_width, win_height = get_active_window_info(window_id)
+    return Window(
+        window_id,
+        win_corner,
+        win_width,
+        win_height,
+        maxed_v,
+        maxed_h,
+    )
+
+
+def calculate_new_window(monitor_from, monitor_to, window):
+    rel_x = window.top_left.x - monitor_from.top_left.x
+    rel_y = window.top_left.y - monitor_from.top_left.y
+
+    new_rel_x = rel_x * monitor_to.height // monitor_from.height
+    new_rel_y = rel_y * monitor_to.width // monitor_from.width
+    win_corner = Pixel(
+        monitor_to.top_left.x + new_rel_x,
+        monitor_to.top_left.y + new_rel_y
+    )
+    win_width = window.width * monitor_to.width // monitor_from.width
+    win_height = window.height * monitor_to.height // monitor_from.height
+
+    return win_corner, win_width, win_height
+
+
+def unmaximise_window(window_id):
+    run([
+        'wmctrl',
+        '-ir',
+        window_id,
+        '-b',
+        'remove,maximized_vert,maximized_horz',
+    ])
+
+
+def resize_window(window, corner, height, width):
+    run([
+        'wmctrl',
+        '-ir',
+        window.window_id,
+        '-e',
+        '0,{corner_x},{corner_y},{width},{height}'.format(
+            corner_x=corner.x,
+            corner_y=corner.y,
+            width=width,
+            height=height,
+        ),
+    ])
+
+    maximisation = None
+    if window.maxed_h and window.maxed_v:
+        maximisation = 'maximized_vert,maximized_horz'
+    elif window.maxed_h:
+        maximisation = 'maximized_horz'
+    elif window.maxed_v:
+        maximisation = 'maximized_vert'
+
+    if maximisation:
+        run([
+            'wmctrl',
+            '-ir',
+            window.window_id,
+            '-b',
+            'add,{add_maximisation}'.format(add_maximisation=maximisation),
+        ])
+
+
+def get_monitors(movement):
+    monitors = all_monitors()
+    number_of_monitors = len(monitors)
+    monitor_index = 0
+    for index, monitor in enumerate(monitors):
+        if active_window.top_left in monitor:
+            monitor_index = index
+            break
+
+    if movement == 'p':
+        new_monitor_index = monitor_index - 1
+    else:
+        new_monitor_index = (monitor_index + 1) % number_of_monitors
+
+    return monitors[monitor_index], monitors[new_monitor_index]
+
+if __name__ == '__main__':
+    parser = OptionParser()
+    parser.add_option('-m', dest='movement', choices=['n', 'p'])
+    options, _ = parser.parse_args()
+
+    active_window = get_active_window()
+    old_monitor, new_monitor = get_monitors(options.movement)
+
+    new_corner, new_width, new_height = calculate_new_window(
+        old_monitor,
+        new_monitor,
+        active_window,
+    )
+
+    unmaximise_window(active_window.window_id)
+    resize_window(active_window, new_corner, new_height, new_width)
